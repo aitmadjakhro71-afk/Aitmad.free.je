@@ -1,204 +1,200 @@
-const crypto = require('crypto');
-if (!globalThis.crypto) {
-    globalThis.crypto = crypto.webcrypto || crypto;
-}
+
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const express = require('express');
+const pino = require('pino');
 
 const {
     default: makeWASocket,
     useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion,
-    makeCacheableSignalKeyStore,
-    downloadContentFromMessage,
     Browsers
 } = require('@whiskeysockets/baileys');
-const pino = require('pino');
-const fs = require('fs');
 
-// ==================== BOT CONFIGURATION ====================
+// ==================================================
+// AITMAD MD BOT - RAILWAY EDITION
+// ==================================================
+
 const config = {
-    prefix: '.',
     botName: 'Aitmad MD Bot',
-    defaultNumber: '923213512243',
-    ownerJid: '923213512243@s.whatsapp.net',
+    prefix: '.',
+
+    // Default number supplied for initial pairing.
+    phoneNumber: process.env.PHONE_NUMBER || '03213512243',
+
+    ownerNumber: process.env.OWNER_NUMBER || '03213512243',
+
+    sessionDir: process.env.SESSION_DIR || '/data/auth_info_main',
+
     autoRead: true,
-    autoTypingOnly: true,
     autoReact: true,
-    autoStatusView: true,
-    antiDelete: true,
+    autoTypingOnly: true,
+
     aiAutoReplyDefault: false,
     aiReplyInGroups: false,
-    cache: {
-        maxItems: 500,
-        ttlMs: 6 * 60 * 60 * 1000
-    },
+
     ai: {
         apiKey: process.env.AI_API_KEY || '',
-        endpoint: process.env.AI_ENDPOINT || 'https://api.openai.com/v1/chat/completions',
-        model: process.env.AI_MODEL || 'gpt-4o-mini',
-        offlineSystemPrompt:
-            "You are Aitmad's AI assistant on WhatsApp. Aitmad is currently offline or away. Reply politely and concisely, and let the sender know Aitmad will respond when back."
+        endpoint:
+            process.env.AI_ENDPOINT ||
+            'https://api.openai.com/v1/chat/completions',
+        model: process.env.AI_MODEL || 'gpt-4o-mini'
     }
 };
 
-const messageStore = new Map();
-const viewOnceStore = new Map();
-let aiAutoReply = Boolean(config.aiAutoReplyDefault);
+const logger = pino({ level: 'silent' });
 
-function setCachedItem(store, key, value) {
-    if (!key) return;
-    if (store.has(key)) {
-        store.delete(key);
-    }
-    store.set(key, {
-        value,
-        savedAt: Date.now()
+let sock = null;
+let aiAutoReply = config.aiAutoReplyDefault;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+let isStarting = false;
+let isShuttingDown = false;
+let currentConnectionId = 0;
+
+const app = express();
+
+app.get('/', (req, res) => {
+    res.status(200).send(
+        `${config.botName} is running.`
+    );
+});
+
+app.get('/health', (req, res) => {
+    res.status(200).json({
+        status: 'running',
+        connected: Boolean(sock?.user),
+        bot: config.botName,
+        uptime: Math.floor(process.uptime())
     });
-    enforceStoreLimits(store);
+});
+
+const PORT = Number(process.env.PORT) || 3000;
+
+const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`HTTP server listening on port ${PORT}`);
+});
+
+// ==================================================
+// NUMBER NORMALIZATION
+// ==================================================
+
+function normalizeNumber(input) {
+    let number = String(input || '').replace(/\D/g, '');
+
+    if (number.startsWith('00')) {
+        number = number.slice(2);
+    }
+
+    if (number.startsWith('0') && number.length === 11) {
+        number = '92' + number.slice(1);
+    }
+
+    if (number.startsWith('3') && number.length === 10) {
+        number = '92' + number;
+    }
+
+    return number;
 }
 
-function getCachedItem(store, key) {
-    if (!key || !store.has(key)) return null;
-    const entry = store.get(key);
-    if (!entry) {
-        store.delete(key);
-        return null;
-    }
-    if (Date.now() - entry.savedAt > config.cache.ttlMs) {
-        store.delete(key);
-        return null;
-    }
-    return entry.value;
+function isValidNumber(number) {
+    return /^[1-9][0-9]{7,14}$/.test(number);
 }
 
-function enforceStoreLimits(store) {
-    const now = Date.now();
-    for (const [k, entry] of store.entries()) {
-        if (!entry || now - entry.savedAt > config.cache.ttlMs) {
-            store.delete(k);
-        }
-    }
-    while (store.size > config.cache.maxItems) {
-        const oldestKey = store.keys().next().value;
-        store.delete(oldestKey);
-    }
-}
+// ==================================================
+// OWNER AUTHENTICATION
+// ==================================================
 
-setInterval(() => {
-    enforceStoreLimits(messageStore);
-    enforceStoreLimits(viewOnceStore);
-}, 15 * 60 * 1000);
-
-function normalizePhoneNumber(input) {
-    let digits = String(input || '').replace(/[^0-9]/g, '');
-    if (digits.startsWith('0') && digits.length === 11) {
-        digits = '92' + digits.slice(1);
-    }
-    return digits;
-}
-
-function isOwnerMessage(msg, sock) {
+function isOwner(msg) {
     if (msg.key?.fromMe) return true;
-    const sender = (msg.key?.participant || msg.key?.remoteJid || '').split('@')[0].split(':')[0];
-    const owner = (config.ownerJid || '').split('@')[0].split(':')[0];
-    const botUser = (sock.user?.id || '').split('@')[0].split(':')[0];
-    return Boolean(sender && (sender === owner || (botUser && sender === botUser)));
+
+    const sender = (
+        msg.key?.participant ||
+        msg.key?.remoteJid ||
+        ''
+    ).split('@')[0].split(':')[0];
+
+    const owner = normalizeNumber(config.ownerNumber);
+
+    return Boolean(owner && sender === owner);
 }
 
-function hasValidMediaLocation(media) {
-    if (!media || typeof media !== 'object') return false;
-    return Boolean(
-        (typeof media.url === 'string' && media.url.trim().length > 0) ||
-        (typeof media.directPath === 'string' && media.directPath.trim().length > 0)
+// ==================================================
+// MESSAGE HELPERS
+// ==================================================
+
+async function sendText(jid, text, msg) {
+    if (!sock) return;
+
+    return sock.sendMessage(
+        jid,
+        { text: String(text) },
+        msg ? { quoted: msg } : {}
     );
 }
 
-async function fetchMediaBuffer(mediaMessage, mediaType) {
-    if (!hasValidMediaLocation(mediaMessage)) {
-        throw new Error('No valid media URL or directPath present in message');
+function extractText(message) {
+    if (!message) return '';
+
+    let content = message;
+
+    while (
+        content.ephemeralMessage?.message ||
+        content.documentWithCaptionMessage?.message
+    ) {
+        content =
+            content.ephemeralMessage?.message ||
+            content.documentWithCaptionMessage?.message;
     }
-    const stream = await downloadContentFromMessage(mediaMessage, mediaType);
-    const chunks = [];
-    for await (const chunk of stream) {
-        chunks.push(chunk);
-    }
-    return Buffer.concat(chunks);
+
+    return (
+        content.conversation ||
+        content.extendedTextMessage?.text ||
+        content.imageMessage?.caption ||
+        content.videoMessage?.caption ||
+        ''
+    ).trim();
 }
 
-function unwrapMessageContent(content) {
-    let current = content;
-    while (current) {
-        if (current.ephemeralMessage?.message) {
-            current = current.ephemeralMessage.message;
-        } else if (current.viewOnceMessage?.message) {
-            current = current.viewOnceMessage.message;
-        } else if (current.viewOnceMessageV2?.message) {
-            current = current.viewOnceMessageV2.message;
-        } else if (current.viewOnceMessageV2Extension?.message) {
-            current = current.viewOnceMessageV2Extension.message;
-        } else if (current.documentWithCaptionMessage?.message) {
-            current = current.documentWithCaptionMessage.message;
-        } else {
-            break;
-        }
-    }
-    return current;
-}
+// ==================================================
+// AI ENGINE
+// ==================================================
 
-function extractViewOncePayload(msgContent) {
-    if (!msgContent) return null;
+async function askAI(prompt, isAutoReply = false) {
+    const cleanPrompt = String(prompt || '').trim();
 
-    const hasViewOnceWrapper = Boolean(
-        msgContent.viewOnceMessage ||
-        msgContent.viewOnceMessageV2 ||
-        msgContent.viewOnceMessageV2Extension ||
-        msgContent.ephemeralMessage?.message?.viewOnceMessage ||
-        msgContent.ephemeralMessage?.message?.viewOnceMessageV2 ||
-        msgContent.ephemeralMessage?.message?.viewOnceMessageV2Extension
-    );
-
-    const unwrapped = unwrapMessageContent(msgContent);
-    if (!unwrapped) return null;
-
-    if (unwrapped.imageMessage && (hasViewOnceWrapper || unwrapped.imageMessage.viewOnce)) {
-        return hasValidMediaLocation(unwrapped.imageMessage)
-            ? { type: 'image', media: unwrapped.imageMessage }
-            : null;
-    }
-    if (unwrapped.videoMessage && (hasViewOnceWrapper || unwrapped.videoMessage.viewOnce)) {
-        return hasValidMediaLocation(unwrapped.videoMessage)
-            ? { type: 'video', media: unwrapped.videoMessage }
-            : null;
-    }
-    if (unwrapped.audioMessage && (hasViewOnceWrapper || unwrapped.audioMessage.viewOnce)) {
-        return hasValidMediaLocation(unwrapped.audioMessage)
-            ? { type: 'audio', media: unwrapped.audioMessage }
-            : null;
-    }
-
-    return null;
-}
-
-async function askAI(promptText, { isAutoReply = false } = {}) {
-    const cleanPrompt = String(promptText || '').trim();
     if (!cleanPrompt) {
-        return '⚠️ Sawal likhein. Misaal: `.ai hi` ya `.ai on` / `.ai off`';
+        return 'Please enter a question.';
     }
 
     if (!config.ai.apiKey) {
         return isAutoReply
-            ? '🤖 Main Aitmad ka AI assistant hoon. Aitmad abhi offline hain, wapas aakar jawab denge.'
-            : '⚠️ `AI_API_KEY` set nahi hai. Env variable `AI_API_KEY` ya `config.ai.apiKey` mein API key daalein.';
+            ? 'Aitmad is currently offline. He will reply when available.'
+            : 'AI API is not configured. Set AI_API_KEY in Railway Variables.';
     }
-
-    const messages = [];
-    if (isAutoReply) {
-        messages.push({ role: 'system', content: config.ai.offlineSystemPrompt });
-    }
-    messages.push({ role: 'user', content: cleanPrompt });
 
     try {
-        const res = await fetch(config.ai.endpoint, {
+        const messages = [];
+
+        if (isAutoReply) {
+            messages.push({
+                role: 'system',
+                content:
+                    'You are Aitmad AI Assistant on WhatsApp. ' +
+                    'Aitmad is currently offline. Reply politely, ' +
+                    'naturally and concisely.'
+            });
+        }
+
+        messages.push({
+            role: 'user',
+            content: cleanPrompt
+        });
+
+        const response = await fetch(config.ai.endpoint, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -211,659 +207,522 @@ async function askAI(promptText, { isAutoReply = false } = {}) {
             signal: AbortSignal.timeout(25000)
         });
 
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-            const detail = data?.error?.message || `HTTP ${res.status}`;
-            return `⚠️ AI request fail ho gayi: ${detail}`;
+        if (!response.ok) {
+            console.error('AI request failed:', response.status);
+            return 'AI service is temporarily unavailable.';
         }
 
-        const reply = data?.choices?.[0]?.message?.content?.trim();
-        return reply || '🤖 AI se koi jawab nahi mila.';
-    } catch (err) {
-        return `⚠️ AI request fail ho gayi: ${err.message || 'Unknown error'}`;
+        const data = await response.json();
+
+        return (
+            data?.choices?.[0]?.message?.content?.trim() ||
+            'AI did not return a response.'
+        );
+
+    } catch (error) {
+        console.error('AI Error:', error.message);
+        return 'AI service is temporarily unavailable.';
     }
 }
 
-function extractYouTubeId(input) {
-    const str = String(input || '').trim();
-    const patterns = [
-        /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/|youtube\.com\/embed\/)([A-Za-z0-9_-]{11})/,
-        /^([A-Za-z0-9_-]{11})$/
-    ];
-    for (const re of patterns) {
-        const match = str.match(re);
-        if (match && match[1]) return match[1];
+// ==================================================
+// OWNER TOGGLE
+// ==================================================
+
+async function toggleFeature(msg, key, label, args) {
+    const jid = msg.key.remoteJid;
+
+    if (!isOwner(msg)) {
+        return sendText(jid, 'Owner permission required.', msg);
     }
-    return null;
+
+    const mode = (args || '').toLowerCase();
+
+    if (mode === 'on') {
+        config[key] = true;
+    } else if (mode === 'off') {
+        config[key] = false;
+    } else {
+        config[key] = !config[key];
+    }
+
+    return sendText(
+        jid,
+        `${label}: ${config[key] ? 'ON' : 'OFF'}`,
+        msg
+    );
 }
 
-async function resolveYouTubeTarget(queryOrUrl) {
-    const videoId = extractYouTubeId(queryOrUrl);
-    if (videoId) {
-        return {
-            videoId,
-            title: `YouTube Video (${videoId})`,
-            url: `https://www.youtube.com/watch?v=${videoId}`
-        };
-    }
+// ==================================================
+// COMMAND HANDLER
+// ==================================================
 
-    const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(queryOrUrl)}`;
-    const response = await fetch(searchUrl, {
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9'
-        },
-        signal: AbortSignal.timeout(15000)
-    });
+async function handleCommand(msg, text) {
+    const jid = msg.key.remoteJid;
 
-    const html = await response.text();
-    const match = html.match(/var ytInitialData = (\{.*?\});<\/script>/);
-    if (!match || !match[1]) return null;
+    const parts = text
+        .slice(config.prefix.length)
+        .trim()
+        .split(/\s+/);
 
-    const data = JSON.parse(match[1]);
-    const contents =
-        data?.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents || [];
+    const command = (parts.shift() || '').toLowerCase();
+    const args = parts.join(' ');
 
-    for (const section of contents) {
-        const items = section?.itemSectionRenderer?.contents || [];
-        for (const item of items) {
-            const video = item?.videoRenderer;
-            if (video?.videoId) {
-                const title = video.title?.runs?.map(r => r.text).join('') || 'YouTube Video';
-                return {
-                    videoId: video.videoId,
-                    title,
-                    url: `https://www.youtube.com/watch?v=${video.videoId}`
-                };
-            }
-        }
-    }
-    return null;
-}
+    switch (command) {
 
-async function getYouTubeDownloadUrl(ytUrl) {
-    try {
-        const res = await fetch('https://api.cobalt.tools/api/json', {
-            method: 'POST',
-            headers: {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                url: ytUrl,
-                videoQuality: '720'
-            }),
-            signal: AbortSignal.timeout(20000)
-        });
-        const data = await res.json().catch(() => ({}));
-        if (data?.url) return data.url;
-        if (Array.isArray(data?.picker) && data.picker[0]?.url) return data.picker[0].url;
-    } catch (_) {}
+        case 'menu':
+            return sendText(jid,
+`╭━━━〔 ${config.botName} 〕━━━╮
 
-    const fallbackEndpoints = [
-        `https://api.ryzendesu.vip/api/downloader/ytmp4?url=${encodeURIComponent(ytUrl)}`,
-        `https://api.siputzx.my.id/api/d/ytmp4?url=${encodeURIComponent(ytUrl)}`
-    ];
+🔗 SYSTEM
+▸ .ping
+▸ .menu
 
-    for (const endpoint of fallbackEndpoints) {
-        try {
-            const r = await fetch(endpoint, { signal: AbortSignal.timeout(20000) });
-            const j = await r.json().catch(() => ({}));
-            const candidate =
-                j?.url ||
-                j?.data?.url ||
-                j?.data?.download ||
-                j?.result?.url ||
-                j?.result?.download ||
-                j?.download_url;
-            if (typeof candidate === 'string' && candidate.startsWith('http')) {
-                return candidate;
-            }
-        } catch (_) {}
-    }
+🤖 AI ASSISTANT
+▸ .ai <question>
+▸ .ai on
+▸ .ai off
+▸ .ai status
 
-    return null;
-}
+⚙️ SETTINGS
+▸ .autoread on/off
+▸ .autoreact on/off
+▸ .autotyping on/off
 
-// ==================== MAIN BOT FUNCTION ====================
-async function startBot(sessionFolder = 'auth_info_main', customNumber = null, requesterJid = null, mainSock = null) {
-    const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
-    const { version } = await fetchLatestBaileysVersion();
+╰━━━━━━━━━━━━━━━━━━╯`, msg);
 
-    const sock = makeWASocket({
-        version,
-        logger: pino({ level: 'silent' }),
-        printQRInTerminal: false,
-        auth: {
-            creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
-        },
-        browser: Browsers.macOS('Desktop')
-    });
+        case 'ping': {
+            const start = Date.now();
 
-    let pairingRequested = false;
+            await sendText(jid, '🏓 Pong!', msg);
 
-    async function requestCodeOnce() {
-        if (pairingRequested || sock.authState.creds.registered) return;
-        pairingRequested = true;
-
-        const phoneNumber = normalizePhoneNumber(customNumber || config.defaultNumber);
-        try {
-            await new Promise(resolve => setTimeout(resolve, 4000));
-            if (sock.authState.creds.registered) return;
-
-            let code = await sock.requestPairingCode(phoneNumber);
-            code = code?.match(/.{1,4}/g)?.join('-') || code;
-
-            if (requesterJid && mainSock) {
-                await mainSock.sendMessage(requesterJid, {
-                    text: `✅ *Pairing Code Generated!*\n\n📱 *Number:* +${phoneNumber}\n🔑 *Code:* \`${code}\`\n\n_WhatsApp > Linked Devices > Link with phone number mein ja kar ye code enter karein._`
-                });
-            } else {
-                console.log('\n========================================');
-                console.log(`📱 Number: +${phoneNumber}`);
-                console.log(`🔑 PAIR CODE: ${code}`);
-                console.log('ℹ️ WhatsApp mein bina hyphen (-) ke 8 characters daalein.');
-                console.log('========================================\n');
-            }
-        } catch (err) {
-            pairingRequested = false;
-            console.error('Pairing Error:', err?.message || err);
-            if (requesterJid && mainSock) {
-                await mainSock.sendMessage(requesterJid, {
-                    text: '❌ Pairing code generate karne mein masla aaya. Number check karein.'
-                });
-            }
-        }
-    }
-
-    sock.ev.on('creds.update', saveCreds);
-
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect } = update;
-
-        if (!sock.authState.creds.registered && !pairingRequested && connection === 'connecting') {
-            requestCodeOnce();
+            return console.log(
+                `Ping response sent in ${Date.now() - start}ms`
+            );
         }
 
-        if (connection === 'close') {
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            console.log(`⚠️ Connection closed (${sessionFolder}). Status code: ${statusCode || 'unknown'}`);
+        case 'ai': {
+            const lower = args.toLowerCase();
 
-            if (statusCode === DisconnectReason.loggedOut) {
-                console.log(`ℹ️ Session ${sessionFolder} reported loggedOut; keeping folder and retrying...`);
+            if (lower === 'on') {
+                if (!isOwner(msg)) {
+                    return sendText(jid, 'Owner permission required.', msg);
+                }
+
+                aiAutoReply = true;
+                config.autoTypingOnly = false;
+
+                return sendText(jid, 'AI Auto Reply: ON', msg);
             }
 
-            setTimeout(() => {
-                startBot(sessionFolder, customNumber, requesterJid, mainSock);
-            }, 3500);
-        } else if (connection === 'open') {
-            console.log(`✅ Bot Connected! (${sessionFolder})`);
-            if (requesterJid && mainSock) {
-                const activeNum = normalizePhoneNumber(
-                    customNumber || sock.user?.id?.split(':')[0] || config.defaultNumber
+            if (lower === 'off') {
+                if (!isOwner(msg)) {
+                    return sendText(jid, 'Owner permission required.', msg);
+                }
+
+                aiAutoReply = false;
+                config.autoTypingOnly = true;
+
+                return sendText(jid, 'AI Auto Reply: OFF', msg);
+            }
+
+            if (lower === 'status' || !args) {
+                return sendText(
+                    jid,
+                    `AI Auto Reply: ${aiAutoReply ? 'ON' : 'OFF'}\n` +
+                    `API Key: ${config.ai.apiKey ? 'SET' : 'MISSING'}`,
+                    msg
                 );
-                mainSock.sendMessage(requesterJid, {
-                    text: `🎉 *Connected!* +${activeNum} par bot active ho gaya hai.`
-                }).catch(() => {});
             }
-        }
-    });
 
-    async function handleToggleCommand(featureKey, label, args, remoteJid, msg) {
-        if (!isOwnerMessage(msg, sock)) {
-            return await sock.sendMessage(remoteJid, {
-                text: `⛔ Sirf owner \`${label}\` ko change kar sakta hai.`
-            }, { quoted: msg });
-        }
+            await sock.sendPresenceUpdate('composing', jid).catch(() => {});
 
-        const mode = (args[0] || '').toLowerCase();
-        if (mode === 'on') {
-            config[featureKey] = true;
-        } else if (mode === 'off') {
-            config[featureKey] = false;
-        } else {
-            config[featureKey] = !config[featureKey];
+            const answer = await askAI(args);
+
+            await sock.sendPresenceUpdate('paused', jid).catch(() => {});
+
+            return sendText(jid, answer, msg);
         }
 
-        await sock.sendMessage(remoteJid, {
-            text: `⚙️ *${label}:* ${config[featureKey] ? '✅ ON' : '❌ OFF'}`
-        }, { quoted: msg });
+        case 'autoread':
+            return toggleFeature(msg, 'autoRead', 'Auto Read', args);
+
+        case 'autoreact':
+            return toggleFeature(msg, 'autoReact', 'Auto React', args);
+
+        case 'autotyping':
+            return toggleFeature(
+                msg,
+                'autoTypingOnly',
+                'Auto Typing',
+                args
+            );
+
+        default:
+            return null;
     }
-
-    async function handleCommand(command, args, remoteJid, msg, rawText) {
-        switch (command) {
-            case 'menu': {
-                const menuText = `╭━━━〔 *${config.botName}* 〕━━━╮
-┃
-┃ 🔗 *PAIRING & SYSTEM*
-┃ ▸ \`.pair <number>\` - Inbox mein pairing code bhejein
-┃ ▸ \`.ping\` - Bot speed aur status check karein
-┃ ▸ \`.vv\` - Quoted view-once media usi chat mein bhejein
-┃ ▸ \`.menu\` - Commands ki list dekhein
-┃
-┃ 🤖 *AI ASSISTANT*
-┃ ▸ \`.ai on\` - Offline AI auto-reply ON karein
-┃ ▸ \`.ai off\` - Offline AI auto-reply OFF karein
-┃ ▸ \`.ai status\` - AI ON/OFF status check karein
-┃ ▸ \`.ai <prompt>\` - AI se direct jawab lein
-┃
-┃ 📥 *DOWNLOADERS*
-┃ ▸ \`.youtube <title/url>\` - YouTube video download
-┃ ▸ \`.tiktok <url>\` - Bina watermark TikTok video
-┃
-┃ ⚙️ *TOGGLE COMMANDS*
-┃ ▸ \`.autoreact <on/off>\` (${config.autoReact ? '✅ ON' : '❌ OFF'})
-┃ ▸ \`.autostatus <on/off>\` (${config.autoStatusView ? '✅ ON' : '❌ OFF'})
-┃ ▸ \`.antidelete <on/off>\` (${config.antiDelete ? '✅ ON' : '❌ OFF'})
-┃ ▸ \`.autoread <on/off>\` (${config.autoRead ? '✅ ON' : '❌ OFF'})
-┃ ▸ \`.autotyping <on/off>\` (${config.autoTypingOnly ? '✅ ON' : '❌ OFF'})
-┃ ▸ *AI Auto-Reply:* ${aiAutoReply ? '✅ ON' : '❌ OFF'}
-┃
-╰━━━━━━━━━━━━━━━━━━━━━━╯`;
-
-                await sock.sendMessage(remoteJid, { text: menuText }, { quoted: msg });
-                break;
-            }
-
-            case 'autoreact':
-                await handleToggleCommand('autoReact', 'Auto-React', args, remoteJid, msg);
-                break;
-
-            case 'autostatus':
-                await handleToggleCommand('autoStatusView', 'Auto-Status View', args, remoteJid, msg);
-                break;
-
-            case 'antidelete':
-                await handleToggleCommand('antiDelete', 'Anti-Delete', args, remoteJid, msg);
-                break;
-
-            case 'autoread':
-                await handleToggleCommand('autoRead', 'Auto-Read', args, remoteJid, msg);
-                break;
-
-            case 'autotyping':
-                await handleToggleCommand('autoTypingOnly', 'Auto-Typing Only', args, remoteJid, msg);
-                break;
-
-            case 'ai': {
-                const subArgsText = rawText.slice(config.prefix.length + command.length).trim();
-                const lowerSub = subArgsText.toLowerCase();
-
-                if (lowerSub === 'on') {
-                    if (!isOwnerMessage(msg, sock)) {
-                        await sock.sendMessage(remoteJid, { text: '⛔ Sirf owner `.ai on` kar sakta hai.' }, { quoted: msg });
-                        break;
-                    }
-                    aiAutoReply = true;
-                    config.autoTypingOnly = false;
-                    await sock.sendMessage(remoteJid, {
-                        text:
-                            `✅ *AI Auto-Reply ON* ho gaya hai.\n` +
-                            `• *Auto-Typing Only:* OFF\n` +
-                            `• *API Key:* ${config.ai.apiKey ? '✅ Set' : '⚠️ Missing (fallback message active)'}`
-                    }, { quoted: msg });
-                    break;
-                }
-
-                if (lowerSub === 'off') {
-                    if (!isOwnerMessage(msg, sock)) {
-                        await sock.sendMessage(remoteJid, { text: '⛔ Sirf owner `.ai off` kar sakta hai.' }, { quoted: msg });
-                        break;
-                    }
-                    aiAutoReply = false;
-                    config.autoTypingOnly = true;
-                    await sock.sendMessage(remoteJid, {
-                        text: '⛔ *AI Auto-Reply OFF* ho gaya hai. (Auto-Typing Only wapas ON)'
-                    }, { quoted: msg });
-                    break;
-                }
-
-                if (!subArgsText || lowerSub === 'status') {
-                    await sock.sendMessage(remoteJid, {
-                        text:
-                            `🤖 *AI Status*\n` +
-                            `• *AI Auto-Reply:* ${aiAutoReply ? '✅ ON' : '❌ OFF'}\n` +
-                            `• *Auto-Typing Only:* ${config.autoTypingOnly ? '✅ ON' : '❌ OFF'}\n` +
-                            `• *API Key:* ${config.ai.apiKey ? '✅ Configured' : '⚠️ Missing'}\n\n` +
-                            `*Commands:*\n` +
-                            `▸ \`.ai on\`\n` +
-                            `▸ \`.ai off\`\n` +
-                            `▸ \`.ai status\`\n` +
-                            `▸ \`.ai hi\``
-                    }, { quoted: msg });
-                    break;
-                }
-
-                await sock.sendPresenceUpdate('composing', remoteJid).catch(() => {});
-                const aiAnswer = await askAI(subArgsText, { isAutoReply: false });
-                await sock.sendPresenceUpdate('paused', remoteJid).catch(() => {});
-                await sock.sendMessage(remoteJid, { text: aiAnswer }, { quoted: msg });
-                break;
-            }
-
-            case 'ping': {
-                const startTime = Date.now();
-                const sent = await sock.sendMessage(remoteJid, { text: '🏓 Pinging...' }, { quoted: msg });
-                const latency = Date.now() - startTime;
-                const uptimeSec = Math.floor(process.uptime());
-                const mins = Math.floor(uptimeSec / 60);
-                const secs = uptimeSec % 60;
-                const memMb = Math.round(process.memoryUsage().rss / (1024 * 1024));
-
-                await sock.sendMessage(remoteJid, {
-                    text: `⚡ *Pong!*\n📶 *Speed:* ${latency} ms\n⏱️ *Uptime:* ${mins}m ${secs}s\n💾 *RAM:* ${memMb} MB (Cache: ${messageStore.size})`,
-                    edit: sent.key
-                });
-                break;
-            }
-
-            case 'vv': {
-                const contextInfo =
-                    msg.message?.extendedTextMessage?.contextInfo ||
-                    msg.message?.imageMessage?.contextInfo ||
-                    msg.message?.videoMessage?.contextInfo ||
-                    {};
-
-                const quotedStanzaId = contextInfo.stanzaId;
-                const quotedMsgContent = contextInfo.quotedMessage;
-
-                let voPayload = extractViewOncePayload(quotedMsgContent);
-
-                if (!voPayload && quotedStanzaId) {
-                    const cached = getCachedItem(viewOnceStore, quotedStanzaId);
-                    if (cached && hasValidMediaLocation(cached.media)) {
-                        voPayload = cached;
-                    }
-                }
-
-                if (!voPayload) {
-                    return await sock.sendMessage(remoteJid, {
-                        text: '⚠️ View-Once media ka valid URL/path nahi mila. Bot chalne ke baad aaye View-Once message ko reply karke `.vv` likhein.'
-                    }, { quoted: msg });
-                }
-
-                try {
-                    const buffer = await fetchMediaBuffer(voPayload.media, voPayload.type);
-                    if (voPayload.type === 'image') {
-                        await sock.sendMessage(remoteJid, {
-                            image: buffer,
-                            caption: voPayload.media.caption || '🔓 View-Once Revealed'
-                        }, { quoted: msg });
-                    } else if (voPayload.type === 'video') {
-                        await sock.sendMessage(remoteJid, {
-                            video: buffer,
-                            caption: voPayload.media.caption || '🔓 View-Once Revealed'
-                        }, { quoted: msg });
-                    } else if (voPayload.type === 'audio') {
-                        await sock.sendMessage(remoteJid, {
-                            audio: buffer,
-                            ptt: Boolean(voPayload.media.ptt)
-                        }, { quoted: msg });
-                    }
-                } catch (e) {
-                    console.error('VV Error:', e);
-                    await sock.sendMessage(remoteJid, {
-                        text: `❌ View-Once media open karne mein error aaya: ${e?.message || 'Unknown error'}`
-                    }, { quoted: msg });
-                }
-                break;
-            }
-
-            case 'youtube':
-            case 'yt': {
-                const query = rawText.slice(config.prefix.length + command.length).trim();
-                if (!query) {
-                    return await sock.sendMessage(remoteJid, {
-                        text: '⚠️ Video ka naam ya YouTube link dein.\nMisaal: `.youtube Motu Patlu` ya `.youtube https://youtu.be/...`'
-                    }, { quoted: msg });
-                }
-
-                await sock.sendMessage(remoteJid, {
-                    text: `🔎 *YouTube* par "${query}" process ho raha hai...`
-                }, { quoted: msg });
-
-                try {
-                    const videoInfo = await resolveYouTubeTarget(query);
-                    if (!videoInfo) {
-                        return await sock.sendMessage(remoteJid, {
-                            text: `❌ "${query}" ke liye koi YouTube video nahi mili.`
-                        }, { quoted: msg });
-                    }
-
-                    const downloadUrl = await getYouTubeDownloadUrl(videoInfo.url);
-                    if (!downloadUrl) {
-                        return await sock.sendMessage(remoteJid, {
-                            text: `🎬 *Found:* ${videoInfo.title}\n🔗 ${videoInfo.url}\n\n⚠️ Filhal stream download link nahi mil saka (server restriction ya age/region block ho sakta hai).`
-                        }, { quoted: msg });
-                    }
-
-                    await sock.sendMessage(remoteJid, {
-                        video: { url: downloadUrl },
-                        caption: `✅ *YouTube Video*\n📌 *Title:* ${videoInfo.title}\n🔗 ${videoInfo.url}`
-                    }, { quoted: msg });
-                } catch (e) {
-                    console.error('YouTube Command Error:', e);
-                    await sock.sendMessage(remoteJid, {
-                        text: '❌ YouTube video download karte waqt error aaya.'
-                    }, { quoted: msg });
-                }
-                break;
-            }
-
-            case 'pair': {
-                const targetNumber = normalizePhoneNumber(args[0]);
-                if (!targetNumber) {
-                    return await sock.sendMessage(remoteJid, {
-                        text: '⚠️ Number likhein.\nMisaal: `.pair 03213512243` ya `.pair 923213512243`'
-                    }, { quoted: msg });
-                }
-
-                await sock.sendMessage(remoteJid, {
-                    text: '⏳ Pairing code generate ho raha hai...'
-                }, { quoted: msg });
-
-                const newSessionDir = `auth_info_${targetNumber}`;
-                if (fs.existsSync(newSessionDir)) {
-                    fs.rmSync(newSessionDir, { recursive: true, force: true });
-                }
-                startBot(newSessionDir, targetNumber, remoteJid, sock);
-                break;
-            }
-
-            case 'tiktok': {
-                const url = args[0];
-                if (!url || !url.includes('tiktok.com')) {
-                    return await sock.sendMessage(remoteJid, {
-                        text: '⚠️ Sahi TikTok link dein.\nMisaal: `.tiktok https://vt.tiktok.com/...`'
-                    }, { quoted: msg });
-                }
-
-                await sock.sendMessage(remoteJid, {
-                    text: '⏳ Video download ho rahi hai...'
-                }, { quoted: msg });
-
-                try {
-                    const response = await fetch(`https://www.tikwm.com/api/?url=${encodeURIComponent(url)}`);
-                    const resData = await response.json();
-                    const videoUrl = resData?.data?.play;
-                    const title = resData?.data?.title || 'TikTok Video';
-
-                    if (videoUrl) {
-                        await sock.sendMessage(remoteJid, {
-                            video: { url: videoUrl },
-                            caption: `✅ *Downloaded via ${config.botName}*\n📝 ${title}`
-                        }, { quoted: msg });
-                    } else {
-                        await sock.sendMessage(remoteJid, { text: '❌ Video nahi mil saki.' }, { quoted: msg });
-                    }
-                } catch (e) {
-                    await sock.sendMessage(remoteJid, { text: '❌ Download karte waqt error aaya.' }, { quoted: msg });
-                }
-                break;
-            }
-
-            default:
-                break;
-        }
-    }
-
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type !== 'notify') return;
-
-        for (const msg of messages) {
-            if (!msg.message) continue;
-
-            const remoteJid = msg.key.remoteJid;
-            const isStatus = remoteJid === 'status@broadcast';
-
-            if (isStatus) {
-                if (config.autoStatusView && !msg.key.fromMe) {
-                    try {
-                        await sock.readMessages([msg.key]);
-                        const senderJid = msg.key.participant;
-                        if (senderJid) {
-                            await sock.sendMessage(remoteJid, {
-                                react: { text: '💚', key: msg.key }
-                            }, { statusJidList: [senderJid] });
-                        }
-                    } catch (err) {
-                        console.error('Status Handling Error:', err);
-                    }
-                }
-                continue;
-            }
-
-            const voPayload = extractViewOncePayload(msg.message);
-            if (voPayload && msg.key.id && hasValidMediaLocation(voPayload.media)) {
-                setCachedItem(viewOnceStore, msg.key.id, voPayload);
-            }
-
-            if (config.antiDelete && !msg.key.fromMe && msg.key.id) {
-                setCachedItem(messageStore, msg.key.id, msg);
-            }
-
-            const unwrapped = unwrapMessageContent(msg.message);
-            const text =
-                unwrapped?.conversation ||
-                unwrapped?.extendedTextMessage?.text ||
-                unwrapped?.imageMessage?.caption ||
-                unwrapped?.videoMessage?.caption ||
-                '';
-
-            const trimmedText = text.trim();
-            const isCommand = trimmedText.startsWith(config.prefix);
-
-            if (isCommand) {
-                const args = trimmedText.slice(config.prefix.length).trim().split(/ +/);
-                const command = args.shift().toLowerCase();
-                await handleCommand(command, args, remoteJid, msg, trimmedText);
-                continue;
-            }
-
-            if (msg.key.fromMe) continue;
-
-            if (config.autoRead) {
-                await sock.readMessages([msg.key]).catch(() => {});
-            }
-
-            if (config.autoReact) {
-                await sock.sendMessage(remoteJid, {
-                    react: { text: '❤️', key: msg.key }
-                }).catch(() => {});
-            }
-
-            if (config.autoTypingOnly && !aiAutoReply) {
-                await sock.sendPresenceUpdate('composing', remoteJid).catch(() => {});
-                setTimeout(async () => {
-                    await sock.sendPresenceUpdate('paused', remoteJid).catch(() => {});
-                }, 5000);
-            }
-
-            const isGroup = remoteJid.endsWith('@g.us');
-            const allowedChat = !isGroup || config.aiReplyInGroups;
-            if (aiAutoReply && allowedChat && trimmedText) {
-                await sock.sendPresenceUpdate('composing', remoteJid).catch(() => {});
-                const aiReply = await askAI(trimmedText, { isAutoReply: true });
-                await sock.sendPresenceUpdate('paused', remoteJid).catch(() => {});
-                await sock.sendMessage(remoteJid, { text: aiReply }, { quoted: msg }).catch(() => {});
-            }
-        }
-    });
-
-    sock.ev.on('messages.update', async (updates) => {
-        if (!config.antiDelete) return;
-        for (const update of updates) {
-            const protocolMsg = update.update?.message?.protocolMessage;
-            const isRevoke =
-                protocolMsg?.type === 0 ||
-                update.update?.messageStubType === 68 ||
-                update.update?.messageStubType === 1 ||
-                update.update?.message === null;
-
-            const targetId = protocolMsg?.key?.id || update.key?.id;
-            if (isRevoke && targetId) {
-                const deletedMsg = getCachedItem(messageStore, targetId);
-                if (!deletedMsg) continue;
-
-                const sender = deletedMsg.key.participant || deletedMsg.key.remoteJid;
-                const chatJid = deletedMsg.key.remoteJid;
-                const voInner = extractViewOncePayload(deletedMsg.message);
-                const unwrapped = voInner
-                    ? { [`${voInner.type}Message`]: voInner.media }
-                    : unwrapMessageContent(deletedMsg.message);
-
-                const recoveredText =
-                    unwrapped?.conversation ||
-                    unwrapped?.extendedTextMessage?.text ||
-                    unwrapped?.imageMessage?.caption ||
-                    unwrapped?.videoMessage?.caption ||
-                    (voInner ? `[View-Once ${voInner.type}]` : '[Media / Other Message]');
-
-                await sock.sendMessage(config.ownerJid, {
-                    text: `🚫 *Anti-Delete Detected!*\n👤 *From:* @${sender.split('@')[0]}\n💬 *Chat:* ${chatJid.split('@')[0]}\n📝 *Message:* ${recoveredText}`,
-                    mentions: [sender]
-                }).catch(() => {});
-
-                if (unwrapped?.imageMessage && hasValidMediaLocation(unwrapped.imageMessage)) {
-                    try {
-                        const imgBuf = await fetchMediaBuffer(unwrapped.imageMessage, 'image');
-                        await sock.sendMessage(config.ownerJid, {
-                            image: imgBuf,
-                            caption: `🗑️ Deleted Image from @${sender.split('@')[0]}`,
-                            mentions: [sender]
-                        });
-                    } catch (e) {}
-                } else if (unwrapped?.videoMessage && hasValidMediaLocation(unwrapped.videoMessage)) {
-                    try {
-                        const vidBuf = await fetchMediaBuffer(unwrapped.videoMessage, 'video');
-                        await sock.sendMessage(config.ownerJid, {
-                            video: vidBuf,
-                            caption: `🗑️ Deleted Video from @${sender.split('@')[0]}`,
-                            mentions: [sender]
-                        });
-                    } catch (e) {}
-                } else if (unwrapped?.audioMessage && hasValidMediaLocation(unwrapped.audioMessage)) {
-                    try {
-                        const audBuf = await fetchMediaBuffer(unwrapped.audioMessage, 'audio');
-                        await sock.sendMessage(config.ownerJid, {
-                            audio: audBuf,
-                            ptt: Boolean(unwrapped.audioMessage.ptt),
-                            mimetype: unwrapped.audioMessage.mimetype || 'audio/mp4'
-                        });
-                    } catch (e) {}
-                }
-
-                messageStore.delete(targetId);
-            }
-        }
-    });
 }
 
-// ==================== AUTO-START SESSIONS ====================
-const folders = fs.readdirSync('./').filter(f => f.startsWith('auth_info_'));
-if (folders.length > 0) {
-    folders.forEach(folder => startBot(folder));
-} else {
-    startBot('auth_info_main');
+// ==================================================
+// CONNECTION RETRY MANAGER
+// ==================================================
+
+function scheduleReconnect(reason) {
+    if (isShuttingDown || reconnectTimer) return;
+
+    reconnectAttempts++;
+
+    // Exponential delay, capped at 60 seconds.
+    const delay = Math.min(
+        5000 * Math.pow(2, Math.min(reconnectAttempts - 1, 4)),
+        60000
+    );
+
+    console.log(
+        `Reconnect scheduled in ${delay / 1000}s. Reason: ${reason}`
+    );
+
+    reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        startBot();
+    }, delay);
 }
+
+// ==================================================
+// PAIRING CODE
+// ==================================================
+
+async function generatePairingCode(socket, state, connectionId) {
+    if (state.creds.registered) {
+        console.log('Existing WhatsApp session found.');
+        return;
+    }
+
+    const number = normalizeNumber(config.phoneNumber);
+
+    if (!isValidNumber(number)) {
+        console.error(
+            'Invalid PHONE_NUMBER. Check Railway Variables.'
+        );
+        return;
+    }
+
+    try {
+        console.log('Preparing WhatsApp pairing code...');
+
+        const code = await socket.requestPairingCode(number);
+
+        // Ignore results from an old socket.
+        if (connectionId !== currentConnectionId) return;
+
+        console.log('================================');
+        console.log('AITMAD WHATSAPP PAIRING CODE');
+        console.log('Number: +' + number);
+        console.log('Code: ' + code);
+        console.log('================================');
+        console.log('Open WhatsApp > Linked Devices.');
+        console.log('Choose Link with phone number.');
+        console.log('Enter the pairing code.');
+
+    } catch (error) {
+        console.error(
+            'Pairing code generation failed:',
+            error.message
+        );
+
+        // Do not restart the entire application just because
+        // a pairing request failed.
+    }
+}
+
+// ==================================================
+// START WHATSAPP BOT
+// ==================================================
+
+async function startBot() {
+    if (isStarting || isShuttingDown) return;
+
+    isStarting = true;
+
+    const connectionId = ++currentConnectionId;
+
+    try {
+        const sessionPath = path.resolve(config.sessionDir);
+
+        fs.mkdirSync(sessionPath, { recursive: true });
+
+        console.log('Loading WhatsApp session...');
+
+        const { state, saveCreds } =
+            await useMultiFileAuthState(sessionPath);
+
+        let version;
+
+        try {
+            const latest = await fetchLatestBaileysVersion();
+            version = latest.version;
+
+            console.log('Baileys WhatsApp version:', version.join('.'));
+        } catch (error) {
+            console.warn(
+                'Version lookup failed. Using library default:',
+                error.message
+            );
+        }
+
+        const socket = makeWASocket({
+            ...(version ? { version } : {}),
+            logger,
+            printQRInTerminal: false,
+            auth: state,
+            browser: Browsers.macOS('Desktop'),
+            markOnlineOnConnect: false,
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
+            keepAliveIntervalMs: 25000,
+            retryRequestDelayMs: 2000
+        });
+
+        sock = socket;
+
+        socket.ev.on('creds.update', saveCreds);
+
+        let pairingStarted = false;
+
+        socket.ev.on('connection.update', async (update) => {
+            if (connectionId !== currentConnectionId) return;
+
+            const { connection, lastDisconnect } = update;
+
+            if (connection === 'connecting') {
+                console.log('Connecting to WhatsApp...');
+            }
+
+            if (
+                connection === 'connecting' &&
+                !state.creds.registered &&
+                !pairingStarted
+            ) {
+                pairingStarted = true;
+
+                setTimeout(() => {
+                    if (
+                        connectionId === currentConnectionId &&
+                        sock === socket
+                    ) {
+                        generatePairingCode(
+                            socket,
+                            state,
+                            connectionId
+                        );
+                    }
+                }, 3000);
+            }
+
+            if (connection === 'open') {
+                reconnectAttempts = 0;
+                console.log('================================');
+                console.log('WHATSAPP CONNECTED SUCCESSFULLY');
+                console.log('Bot:', config.botName);
+                console.log('Number:', socket.user?.id || 'Connected');
+                console.log('================================');
+            }
+
+            if (connection === 'close') {
+                const status =
+                    lastDisconnect?.error?.output?.statusCode;
+
+                console.error(
+                    'WhatsApp connection closed.',
+                    'Status:',
+                    status || 'unknown'
+                );
+
+                if (sock === socket) {
+                    sock = null;
+                }
+
+                isStarting = false;
+                pairingStarted = false;
+
+                if (status === DisconnectReason.loggedOut) {
+                    console.error(
+                        'Session logged out. Manual re-pairing is required.'
+                    );
+                    return;
+                }
+
+                scheduleReconnect(
+                    `Connection closed with status ${status || 'unknown'}`
+                );
+            }
+        });
+
+        // ==================================================
+        // MESSAGE HANDLER
+        // ==================================================
+
+        socket.ev.on('messages.upsert', async ({ messages, type }) => {
+            if (type !== 'notify') return;
+            if (connectionId !== currentConnectionId) return;
+
+            for (const msg of messages) {
+                if (!msg.message) continue;
+                if (msg.key.fromMe) continue;
+
+                const jid = msg.key.remoteJid;
+
+                if (
+                    !jid ||
+                    jid === 'status@broadcast' ||
+                    jid.endsWith('@newsletter')
+                ) {
+                    continue;
+                }
+
+                const messageText = extractText(msg.message);
+
+                if (!messageText) continue;
+
+                try {
+                    if (config.autoRead) {
+                        await socket.readMessages([msg.key]).catch(() => {});
+                    }
+
+                    if (config.autoReact) {
+                        await socket.sendMessage(jid, {
+                            react: {
+                                text: '❤️',
+                                key: msg.key
+                            }
+                        }).catch(() => {});
+                    }
+
+                    if (messageText.startsWith(config.prefix)) {
+                        await handleCommand(msg, messageText);
+                        continue;
+                    }
+
+                    const isGroup = jid.endsWith('@g.us');
+
+                    if (
+                        aiAutoReply &&
+                        (!isGroup || config.aiReplyInGroups)
+                    ) {
+                        await socket.sendPresenceUpdate(
+                            'composing',
+                            jid
+                        ).catch(() => {});
+
+                        const reply = await askAI(
+                            messageText,
+                            true
+                        );
+
+                        await socket.sendPresenceUpdate(
+                            'paused',
+                            jid
+                        ).catch(() => {});
+
+                        await socket.sendMessage(
+                            jid,
+                            { text: reply },
+                            { quoted: msg }
+                        ).catch(() => {});
+                    } else if (config.autoTypingOnly) {
+                        await socket.sendPresenceUpdate(
+                            'composing',
+                            jid
+                        ).catch(() => {});
+
+                        setTimeout(() => {
+                            if (
+                                connectionId === currentConnectionId &&
+                                sock === socket
+                            ) {
+                                socket.sendPresenceUpdate(
+                                    'paused',
+                                    jid
+                                ).catch(() => {});
+                            }
+                        }, 3000);
+                    }
+
+                } catch (error) {
+                    console.error(
+                        'Message processing error:',
+                        error.message
+                    );
+                }
+            }
+        });
+
+        console.log('WhatsApp socket initialized.');
+
+    } catch (error) {
+        console.error('Bot startup failed:', error.message);
+
+        if (connectionId === currentConnectionId) {
+            sock = null;
+            scheduleReconnect(error.message);
+        }
+
+    } finally {
+        isStarting = false;
+    }
+}
+
+// ==================================================
+// GRACEFUL SHUTDOWN
+// ==================================================
+
+async function shutdown(signal) {
+    if (isShuttingDown) return;
+
+    isShuttingDown = true;
+
+    console.log(`${signal} received. Shutting down...`);
+
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+
+    try {
+        if (sock) {
+            sock.end(undefined);
+            sock = null;
+        }
+    } catch (error) {
+        console.error('Socket shutdown error:', error.message);
+    }
+
+    server.close(() => {
+        console.log('HTTP server closed.');
+        process.exit(0);
+    });
+
+    setTimeout(() => process.exit(0), 10000).unref();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+process.on('unhandledRejection', error => {
+    console.error('Unhandled rejection:', error);
+});
+
+process.on('uncaughtException', error => {
+    console.error('Uncaught exception:', error);
+});
+
+// ==================================================
+// START APPLICATION
+// ==================================================
+
+console.log('================================');
+console.log('STARTING AITMAD MD BOT');
+console.log('Railway Edition 2.0');
+console.log('================================');
+
+startBot();
