@@ -387,11 +387,11 @@ async function startBot(sessionFolder = 'auth_info_main', customNumber = null, r
 
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            console.log(`⚠️ Connection closed (${sessionFolder}). Status code: ${statusCode || 'unknown'}`);
 
-            if (!shouldReconnect) {
-                console.log(`Session ${sessionFolder} logged out. Cleaning folder...`);
-                fs.rmSync(sessionFolder, { recursive: true, force: true });
+            // Session folder delete nahi kiya ja raha taake pairing/auth state clean na ho
+            if (statusCode === DisconnectReason.loggedOut) {
+                console.log(`ℹ️ Session ${sessionFolder} reported loggedOut; keeping folder and retrying...`);
             }
 
             setTimeout(() => {
@@ -786,84 +786,4 @@ async function startBot(sessionFolder = 'auth_info_main', customNumber = null, r
                 await sock.sendPresenceUpdate('composing', remoteJid).catch(() => {});
                 const aiReply = await askAI(trimmedText, { isAutoReply: true });
                 await sock.sendPresenceUpdate('paused', remoteJid).catch(() => {});
-                await sock.sendMessage(remoteJid, { text: aiReply }, { quoted: msg }).catch(() => {});
-            }
-        }
-    });
-
-    sock.ev.on('messages.update', async (updates) => {
-        if (!config.antiDelete) return;
-        for (const update of updates) {
-            const protocolMsg = update.update?.message?.protocolMessage;
-            const isRevoke =
-                protocolMsg?.type === 0 ||
-                update.update?.messageStubType === 68 ||
-                update.update?.messageStubType === 1 ||
-                update.update?.message === null;
-
-            const targetId = protocolMsg?.key?.id || update.key?.id;
-            if (isRevoke && targetId) {
-                const deletedMsg = getCachedItem(messageStore, targetId);
-                if (!deletedMsg) continue;
-
-                const sender = deletedMsg.key.participant || deletedMsg.key.remoteJid;
-                const chatJid = deletedMsg.key.remoteJid;
-                const voInner = extractViewOncePayload(deletedMsg.message);
-                const unwrapped = voInner
-                    ? { [`${voInner.type}Message`]: voInner.media }
-                    : unwrapMessageContent(deletedMsg.message);
-
-                const recoveredText =
-                    unwrapped?.conversation ||
-                    unwrapped?.extendedTextMessage?.text ||
-                    unwrapped?.imageMessage?.caption ||
-                    unwrapped?.videoMessage?.caption ||
-                    (voInner ? `[View-Once ${voInner.type}]` : '[Media / Other Message]');
-
-                await sock.sendMessage(config.ownerJid, {
-                    text: `🚫 *Anti-Delete Detected!*\n👤 *From:* @${sender.split('@')[0]}\n💬 *Chat:* ${chatJid.split('@')[0]}\n📝 *Message:* ${recoveredText}`,
-                    mentions: [sender]
-                }).catch(() => {});
-
-                if (unwrapped?.imageMessage && hasValidMediaLocation(unwrapped.imageMessage)) {
-                    try {
-                        const imgBuf = await fetchMediaBuffer(unwrapped.imageMessage, 'image');
-                        await sock.sendMessage(config.ownerJid, {
-                            image: imgBuf,
-                            caption: `🗑️ Deleted Image from @${sender.split('@')[0]}`,
-                            mentions: [sender]
-                        });
-                    } catch (e) {}
-                } else if (unwrapped?.videoMessage && hasValidMediaLocation(unwrapped.videoMessage)) {
-                    try {
-                        const vidBuf = await fetchMediaBuffer(unwrapped.videoMessage, 'video');
-                        await sock.sendMessage(config.ownerJid, {
-                            video: vidBuf,
-                            caption: `🗑️ Deleted Video from @${sender.split('@')[0]}`,
-                            mentions: [sender]
-                        });
-                    } catch (e) {}
-                } else if (unwrapped?.audioMessage && hasValidMediaLocation(unwrapped.audioMessage)) {
-                    try {
-                        const audBuf = await fetchMediaBuffer(unwrapped.audioMessage, 'audio');
-                        await sock.sendMessage(config.ownerJid, {
-                            audio: audBuf,
-                            ptt: Boolean(unwrapped.audioMessage.ptt),
-                            mimetype: unwrapped.audioMessage.mimetype || 'audio/mp4'
-                        });
-                    } catch (e) {}
-                }
-
-                messageStore.delete(targetId);
-            }
-        }
-    });
-}
-
-// ==================== AUTO-START SESSIONS ====================
-const folders = fs.readdirSync('./').filter(f => f.startsWith('auth_info_'));
-if (folders.length > 0) {
-    folders.forEach(folder => startBot(folder));
-} else {
-    startBot('auth_info_main');
-}
+                
